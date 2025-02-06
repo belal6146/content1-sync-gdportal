@@ -1,0 +1,16 @@
+{
+  "dependencies": {
+    "@elastic/elasticsearch": "^8.17.0",
+    "@opensearch-project/opensearch": "^3.2.0",
+    "debug": "^4.3.4",
+    "dotenv": "^16.4.7",
+    "node-cron": "^3.0.3"
+  },
+  "scripts": {
+    "start": "node sync-clusters.js",
+    "debug": "DEBUG=sync:* node sync-clusters.js",
+    "debug:info": "DEBUG=sync:info node sync-clusters.js",
+    "debug:error": "DEBUG=sync:error node sync-clusters.js",
+    "debug:all": "DEBUG=* node sync-clusters.js"
+  }
+}
