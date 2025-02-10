@@ -3,6 +3,9 @@ const { Client: ElasticClient } = require('@elastic/elasticsearch');
 const debug = require('debug');
 require('dotenv').config();
 
+// Set delay time in milliseconds (default: 2 hours)
+const SYNC_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
+
 // Setup debug loggers
 const logInfo = (...args) => {
   debug('sync:info')(...args);
@@ -15,14 +18,6 @@ const logError = (...args) => {
 const logDebug = (...args) => {
   debug('sync:debug')(...args);
   console.debug('[DEBUG]', new Date().toISOString(), ...args);
-};
-const logRequest = (...args) => {
-  debug('sync:request')(...args);
-  console.debug('[REQUEST]', new Date().toISOString(), ...args);
-};
-const logResponse = (...args) => {
-  debug('sync:response')(...args);
-  console.debug('[RESPONSE]', new Date().toISOString(), ...args);
 };
 
 // Validate required environment variables
@@ -61,6 +56,7 @@ const targetClient = new ElasticClient({
 async function syncData(sourceIndex, targetIndex, batchSize = 200) {
   try {
     const startTime = new Date(); // Start time for logging
+    logInfo(`🚀 Sync started at ${startTime.toISOString()}`);
 
     // Check if target index exists
     const indexExists = await targetClient.indices.exists({ index: targetIndex });
@@ -190,29 +186,24 @@ async function syncData(sourceIndex, targetIndex, batchSize = 200) {
 
     const endTime = new Date();
     const duration = (endTime - startTime) / 1000;
-    logInfo(`First sync cycle completed in ${duration.toFixed(2)} seconds.`);
-    logInfo(`Total records processed: ${processedDocs}`);
-    logInfo(`Total records failed: ${failedDocs}`);
+    logInfo(`✅ Sync completed at ${endTime.toISOString()} (Duration: ${duration.toFixed(2)} seconds)`);
+    logInfo(`📊 Total records processed: ${processedDocs}`);
+    logInfo(`⚠️ Total records failed: ${failedDocs}`);
+    logInfo(`🕒 Next sync will start in ${SYNC_INTERVAL / 1000 / 60} minutes...`);
 
-    logInfo('Sync cycle completed successfully. Restarting process...');
-    setTimeout(() => syncData(sourceIndex, targetIndex, batchSize), 5000); // Restart after 5s
+    // Wait for 2 hours before next sync
+    setTimeout(() => syncData(sourceIndex, targetIndex, batchSize), SYNC_INTERVAL);
 
   } catch (error) {
-    logError('Error during sync:', error);
+    logError('❌ Error during sync:', error);
     throw error;
   }
 }
 
-// Start the sync process in a loop
+// Start the sync process
 async function main() {
-  while (true) {
-    try {
-      await syncData(process.env.SOURCE_INDEX_NAME, process.env.TARGET_INDEX_NAME);
-    } catch (error) {
-      console.error('Sync failed:', error);
-    }
-    await new Promise(resolve => setTimeout(resolve, 5000)); // Wait before restarting
-  }
+  logInfo('🔄 Scheduled sync job started...');
+  syncData(process.env.SOURCE_INDEX_NAME, process.env.TARGET_INDEX_NAME);
 }
 
 main();
