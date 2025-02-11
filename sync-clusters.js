@@ -3,8 +3,11 @@ const { Client: ElasticClient } = require('@elastic/elasticsearch');
 const debug = require('debug');
 require('dotenv').config();
 
-// Set delay time in milliseconds (default: 2 hours)
-const SYNC_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
+// Constants
+const BASE_DELAY = 5000; // Minimum delay (5 sec) between bulk operations
+const MAX_DELAY = 30000; // Max delay if Elasticsearch is struggling (30 sec)
+const INITIAL_BATCH_SIZE = 200; // Default batch size
+const MAX_RETRIES = 5; // Max retry attempts for failed bulk inserts
 
 // Setup debug loggers
 const logInfo = (...args) => {
@@ -33,19 +36,19 @@ const requiredEnvVars = [
 ];
 
 const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
-
 if (missingEnvVars.length > 0) {
-  console.error('Missing required environment variables:', missingEnvVars.join(', '));
+  logError('Missing required environment variables:', missingEnvVars.join(', '));
   process.exit(1);
 }
 
-// Configure clients for both clusters
+// Configure OpenSearch Client
 const sourceClient = new OpenSearchClient({
   node: `https://${process.env.AWS_OPENSEARCH_USERNAME}:${process.env.AWS_OPENSEARCH_PASSWORD}@${process.env.AWS_OPENSEARCH_ENDPOINT}`,
   ssl: { rejectUnauthorized: false },
   requestTimeout: 120000,
 });
 
+// Configure Elasticsearch Client
 const targetClient = new ElasticClient({
   cloud: { id: process.env.ELASTIC_CLOUD_ID },
   auth: { apiKey: { id: process.env.ELASTIC_API_KEY_ID, api_key: process.env.ELASTIC_API_KEY_SECRET } },
@@ -53,72 +56,54 @@ const targetClient = new ElasticClient({
   requestTimeout: 120000,
 });
 
-async function syncData(sourceIndex, targetIndex, batchSize = 200) {
+// Sync function
+async function syncData(sourceIndex, targetIndex) {
   try {
-    const startTime = new Date(); // Start time for logging
-    logInfo(`🚀 Sync started at ${startTime.toISOString()}`);
+    const startTime = Date.now();
+    let batchSize = INITIAL_BATCH_SIZE;
+    let delay = BASE_DELAY;
 
-    // Check if target index exists
+    logInfo(`Starting sync for ${sourceIndex} → ${targetIndex}`);
+
+    // Check if the target index exists
     const indexExists = await targetClient.indices.exists({ index: targetIndex });
-
     if (!indexExists) {
       logInfo(`Target index ${targetIndex} does not exist. Creating...`);
-
       const sourceMapping = await sourceClient.indices.getMapping({ index: sourceIndex });
 
       if (!sourceMapping.body) throw new Error('Invalid mapping response from OpenSearch');
-
-      // Modify mapping before creating
-      sourceMapping.body[sourceIndex].mappings.properties.jsonPayload.type = "object";
-      delete sourceMapping.body[sourceIndex].mappings.properties.jsonPayload.fields;
-      delete sourceMapping.body[sourceIndex].mappings.properties.marketVariation.analyzer;
-      delete sourceMapping.body[sourceIndex].mappings.properties.brand.analyzer;
-
-      logInfo(`Creating target index ${targetIndex} with mapping: ${JSON.stringify(sourceMapping.body[sourceIndex].mappings)}`);
 
       await targetClient.indices.create({
         index: targetIndex,
         body: { mappings: sourceMapping.body[sourceIndex].mappings },
       });
 
-      logInfo(`Created target index ${targetIndex}`);
+      logInfo(`Target index ${targetIndex} created successfully`);
     }
 
-    // Get total number of documents in source index
+    // Get total document count
     const countResponse = await sourceClient.count({ index: sourceIndex });
-
     if (!countResponse.body) throw new Error('Invalid count response from OpenSearch');
 
     const totalDocs = countResponse.body.count;
     logInfo(`Total documents to sync: ${totalDocs}`);
-    logDebug(`Starting sync from ${sourceIndex} to ${targetIndex}`);
 
     let processedDocs = 0;
     let failedDocs = 0;
-
-    let scrollResponse;
-    try {
-      scrollResponse = await sourceClient.search({
-        index: sourceIndex,
-        scroll: '1m',
-        size: batchSize,
-        body: { query: { match_all: {} } },
-      });
-    } catch (searchError) {
-      logError('Error initializing scroll search:', searchError);
-      throw searchError;
-    }
-
-    if (!scrollResponse.body || !scrollResponse.body.hits) throw new Error('Invalid scroll response from OpenSearch');
+    let scrollResponse = await sourceClient.search({
+      index: sourceIndex,
+      scroll: '2m',
+      size: batchSize,
+      body: { query: { match_all: {} } },
+    });
 
     let scrollId = scrollResponse.body._scroll_id;
     let documents = scrollResponse.body.hits.hits;
 
     while (documents.length > 0) {
-      processedDocs += documents.length;
-      logInfo(`Processing batch of ${documents.length} documents (${processedDocs}/${totalDocs})`);
-      logDebug(`Current scroll ID: ${scrollId}`);
+      logInfo(`Processing batch of ${documents.length} docs (Total processed: ${processedDocs}/${totalDocs})`);
 
+      // Prepare bulk request
       const operations = documents.flatMap(doc => {
         const source = { ...doc._source };
 
@@ -126,7 +111,7 @@ async function syncData(sourceIndex, targetIndex, batchSize = 200) {
           try {
             source.jsonPayload = JSON.parse(source.jsonPayload);
           } catch (parseError) {
-            logError(`Failed to parse jsonPayload for document ${doc._id}:`, parseError);
+            logError(`Failed to parse jsonPayload for doc ${doc._id}:`, parseError);
             failedDocs++;
           }
         }
@@ -134,76 +119,60 @@ async function syncData(sourceIndex, targetIndex, batchSize = 200) {
         return [{ index: { _index: targetIndex, _id: doc._id } }, source];
       });
 
-      let retries = 3;
-      while (retries > 0) {
+      // Bulk Insert with Smart Retry
+      let success = false;
+      let retries = 0;
+      while (!success && retries < MAX_RETRIES) {
         try {
-          const bulkResponse = await targetClient.bulk({
-            refresh: true,
-            body: operations,
-            timeout: '2m',
-          });
+          const bulkResponse = await targetClient.bulk({ refresh: true, body: operations, timeout: '2m' });
 
           if (bulkResponse.errors) {
-            failedDocs += bulkResponse.items.filter(item => item.index && item.index.error).length;
-            logError('Bulk operation had errors:', bulkResponse.items.filter(item => item.index && item.index.error));
+            failedDocs += bulkResponse.items.filter(item => item.index?.error).length;
+            logError('Bulk operation had errors:', bulkResponse.items.filter(item => item.index?.error));
           }
 
-          break;
+          success = true;
         } catch (bulkError) {
-          retries--;
-          if (retries === 0) {
-            logError('Error during bulk indexing (all retries failed):', bulkError);
-            failedDocs += documents.length;
-            throw bulkError;
-          }
-          logError(`Bulk indexing failed, retrying (${retries} attempts remaining):`, bulkError);
-          await new Promise(resolve => setTimeout(resolve, (3 - retries) * 1000));
+          retries++;
+          logError(`Bulk insert failed (Attempt ${retries}/${MAX_RETRIES}). Retrying in ${delay / 1000}s...`, bulkError);
+          await new Promise(resolve => setTimeout(resolve, delay));
+
+          // Increase delay for next retry
+          delay = Math.min(delay * 2, MAX_DELAY);
         }
       }
 
-      try {
-        const scrollResult = await sourceClient.scroll({
-          scroll_id: scrollId,
-          scroll: '1m',
-        });
+      processedDocs += documents.length;
 
-        if (!scrollResult.body || !scrollResult.body.hits) throw new Error('Invalid scroll result from OpenSearch');
+      // Wait before fetching the next batch
+      logInfo(`⏳ Waiting ${delay / 1000}s before fetching the next batch...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
 
-        scrollId = scrollResult.body._scroll_id;
-        documents = scrollResult.body.hits.hits;
-        logDebug(`Retrieved next batch: ${documents.length} documents`);
-      } catch (scrollError) {
-        logError('Error during scroll:', scrollError);
-        throw scrollError;
-      }
+      // Fetch next batch
+      const scrollResult = await sourceClient.scroll({ scroll_id: scrollId, scroll: '2m' });
+      scrollId = scrollResult.body._scroll_id;
+      documents = scrollResult.body.hits.hits;
     }
 
-    try {
-      await sourceClient.clearScroll({ body: { scroll_id: scrollId } });
-    } catch (clearScrollError) {
-      logError('Error clearing scroll:', clearScrollError);
-    }
+    // Clear the scroll session
+    await sourceClient.clearScroll({ body: { scroll_id: scrollId } });
 
-    const endTime = new Date();
-    const duration = (endTime - startTime) / 1000;
-    logInfo(`✅ Sync completed at ${endTime.toISOString()} (Duration: ${duration.toFixed(2)} seconds)`);
-    logInfo(`📊 Total records processed: ${processedDocs}`);
-    logInfo(`⚠️ Total records failed: ${failedDocs}`);
-    logInfo(`🕒 Next sync will start in ${SYNC_INTERVAL / 1000 / 60} minutes...`);
-
-    // Wait for 2 hours before next sync
-    setTimeout(() => syncData(sourceIndex, targetIndex, batchSize), SYNC_INTERVAL);
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    logInfo(`Sync completed in ${duration}s`);
+    logInfo(`Processed: ${processedDocs} |  Failed: ${failedDocs}`);
 
   } catch (error) {
-    logError('❌ Error during sync:', error);
-    throw error;
+    logError('Error during sync:', error);
   }
 }
 
-// Start the sync process
+// Start sync job every 2 hours
 async function main() {
-  logInfo('🔄 Scheduled sync job started...');
-  syncData(process.env.SOURCE_INDEX_NAME, process.env.TARGET_INDEX_NAME);
+  while (true) {
+    await syncData(process.env.SOURCE_INDEX_NAME, process.env.TARGET_INDEX_NAME);
+    logInfo('Waiting 2 hours before next sync...');
+    await new Promise(resolve => setTimeout(resolve, 2 * 60 * 60 * 1000)); // 2 hours
+  }
 }
 
 main();
