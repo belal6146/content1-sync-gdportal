@@ -4,8 +4,8 @@ const debug = require('debug');
 require('dotenv').config();
 
 // Constants
-const BASE_DELAY = 5000; // Minimum delay (5 sec) between bulk operations
-const MAX_DELAY = 30000; // Max delay if Elasticsearch is struggling (30 sec)
+const BASE_DELAY = 10000; // Minimum delay (10 sec) between bulk operations
+const MAX_DELAY = 60000; // Max delay if Elasticsearch is struggling (60 sec)
 const INITIAL_BATCH_SIZE = 200; // Default batch size
 const MAX_RETRIES = 5; // Max retry attempts for failed bulk inserts
 
